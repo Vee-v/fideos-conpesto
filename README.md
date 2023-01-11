@@ -1,3 +1,7 @@
+#PESTO
+Pipeline for Estimating Stellar Type Ordination
+
+Work in progress for exoplanet detection project at AIUC with FIDEOS spectrograph.
 # Dependencies
 Tested with Python 3.10.8
 

@@ -1,21 +1,24 @@
 from astropy.io import fits
 from astropy import units as u
 from astropy import uncertainty as unc
-from astropy.modeling import models
+from astropy.nddata import StdDevUncertainty
 from pathlib import Path
 import numpy as np
 import scipy
 import warnings
 import argparse
 import specutils
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
 from specutils import Spectrum1D
-from specutils.spectra import SpectralRegion
-from specutils.manipulation import noise_region_uncertainty, extract_region, gaussian_smooth, trapezoid_smooth
-from specutils.fitting import find_lines_threshold, estimate_line_parameters, fit_lines
-
+from specutils.manipulation import LinearInterpolatedResampler
+from specutils.analysis import template_correlate
 
 # GLOBAL VARIABLES
 current_dir = Path.cwd()
+
+def gaussian(x, mu, sig, A):
+    return A * np.exp(- .5 * np.power(x - mu, 2) / np.power(sig, 2))# + b * np.power(x, 2) + c * x + d
 
 
 def read_fits(folder='TIC220414682'):
@@ -40,22 +43,21 @@ def read_fits(folder='TIC220414682'):
     return np.array(spectra)
 
 
-def shifting(spectra):
-    """Function which receives a read_fits output tuple elements and
-    returns the normalized spectrum for each order at RV = refRV and each
-    fits file.
+def ccf(spectra, target, pdf_output):
+    """Function which receives the CERES reduced spectra of a star and calculates the cross correlation function
+    between the first spectrum and each of the other spectra in wavelength log space to estimate the wavelength
+    displacement due to radial velocities.
     """
     # We cycle through all the fits image
-    reference_pos = 0.
-    shifts = np.zeros(spectra.shape[0])
     with warnings.catch_warnings():  # Ignore warnings
         warnings.simplefilter('ignore')
+        noOverlapSpectra = []
         for specNum in range(spectra.shape[0]):
-            linesList = []
             spectraList = []
             wls_aux = np.empty(spectra[specNum, 0, :].shape)
             flux_aux = np.empty(spectra[specNum, 5, :].shape)
             mask = np.ones(spectra[specNum, 0, :].shape)
+            # In this section we mask the overlapped wavelengths of each order.
             for order in range(spectra.shape[2]):
                 wls_aux[order] = spectra[specNum, 0, order]
                 flux_aux[order] = spectra[specNum, 5, order]
@@ -65,47 +67,99 @@ def shifting(spectra):
                 if order > 0:
                     mask = wls_aux[order] < shortestWl
                     wls, flux = wls_aux[order][mask], flux_aux[order][mask]
-                    spectrum = Spectrum1D(flux=(flux-np.median(flux))*u.adu, spectral_axis=wls*u.AA)
+                    uncertainty = StdDevUncertainty(0.1*np.ones(wls.shape[0])*u.adu)
+                    rest_value = 6000. * u.AA  # not sure the implicancies of this
+                    spectrum = Spectrum1D(flux=(flux-np.median(flux))*u.adu, spectral_axis=wls*u.AA,
+                                          uncertainty=uncertainty, velocity_convention='optical',
+                                          rest_value=rest_value)
                 else:
+                    uncertainty = StdDevUncertainty(0.1*np.ones(wls_aux[order].shape[0])*u.adu)
                     spectrum = Spectrum1D(flux=(flux_aux[order]-np.median(flux_aux[order]))*u.adu,
-                                          spectral_axis=wls_aux[order]*u.AA)    
-                spectrum = gaussian_smooth(spectrum, stddev=8)
-                spectrum = noise_region_uncertainty(spectrum, SpectralRegion(5825*u.AA, 5850*u.AA))
-                if not(np.any(np.isnan(spectrum.uncertainty.array))):
-                    
-                    lines = find_lines_threshold(spectrum, noise_factor=3)
-                    linesList.append(lines[lines['line_type'] == 'absorption'])
-                    spectraList.append(spectrum)
+                                          spectral_axis=wls_aux[order]*u.AA, uncertainty=uncertainty)    
+                spectraList.append(spectrum)
                 shortestWl = wls_aux[order, 0]
-            linesList = np.array(linesList)
-            spectraList = np.array(spectraList)
-            deep = 0  # depth of deepest line
-            pos = 0   # wavelength of deepest line
-            pos2 = 0  # wavelength of the 2nd deepest line
-            for order in range(linesList.shape[0]):
-                for i in linesList[order]['line_center_index']:
-                    line_region = SpectralRegion(spectraList[order].spectral_axis[i-4], spectraList[order].spectral_axis[i+4])
-                    line_spectrum = extract_region(spectraList[order], line_region)
-                    estimation = estimate_line_parameters(line_spectrum, models.Gaussian1D())
-                    if estimation.amplitude < deep:
-                        deep = estimation.amplitude
-                        pos2 = pos
-                        pos = estimation.mean
-            # The first spectrum is the reference spectrum, so we need to save the reference position.
-            if specNum == 0:
-                reference_pos = pos.value
-            else:
-                shifts[specNum] = pos.value - reference_pos
+            noOverlapSpectra.append(spectraList)
+        # Here we calculate the CCF for each spectrum against the first taken.
+        figs = []
+        RV_shifts = []
+        for specNum in range(0, spectra.shape[0]):
+            corrCCF = []
+            lagsCCF =[]
+            for order in range(8,26):
+                corr, lags = template_correlate(noOverlapSpectra[specNum][order], noOverlapSpectra[0][order])
+                corrCCF.append(corr)
+                lagsCCF.append(lags)
+            # Here we resample for averaging the CCF
+            orderCCF =[]
+            for i, j in enumerate(corrCCF):
+                wav = lagsCCF[i].value
+                spectrum = Spectrum1D(flux=j*u.adu, spectral_axis=wav * u.AA)
+                orderCCF.append(spectrum)
+            resample_grid = lagsCCF[-1].value
+            resample_grid *= u.AA
+            ccf_resample = LinearInterpolatedResampler()
+            outputCCF = np.zeros((18, len(resample_grid)))
+            x = 0
+            for i in orderCCF:
+                output_ccf = ccf_resample(i, resample_grid)
+                outputCCF[x, :] = output_ccf.flux.value
+                x += 1
+            avgCCF = np.average(outputCCF, axis=0)
+            fig = plt.figure()
+            for i in range(18):
+                plt.plot(lagsCCF[i], corrCCF[i], alpha=0.1)
+            plt.plot(lagsCCF[-1], avgCCF, color='black', label='Average CCF')
+            popt, pcov = scipy.optimize.curve_fit(gaussian, lagsCCF[-1], avgCCF)
+            RV_shifts.append(popt[0] *u.km/u.s)
+            plt.plot(lagsCCF[-1], gaussian(lagsCCF[-1].value, *popt), ls='-.', color='r', label='Gaussian Fit')
+            plt.xlim(-100,100)
+            plt.legend()
+            plt.axvline(popt[0], color='black', ls='--')
+            plt.title(f'$\Delta RV={popt[0]:.5f}$km/s | {target.strip()} | spectrum {specNum}')
+            plt.ylabel('CCF power')
+            plt.xlabel(r'$\Delta RV$ (km/s)')
+#             plt.show()
+            figs.append(fig)
+        if pdf_output:
+            outputname = f'{target.strip()}_{spectra.shape[0]}stack.pdf'
+            p = PdfPages(outputname)
+            for figure in figs:
+                figure.savefig(p, format='pdf')
+            p.close()
+            print(f'Output pdf file saved in {current_dir/outputname}.\n')
+    return RV_shifts
+
+
+def shifting(spectra, shifts):
+    """Function which shifts the spectra depending on the results of function ccf.
+    """
+        
     # First we create the arrays which will hold the zeroed spectrum information
     fullSpectrum = np.zeros((spectra.shape[0], spectra.shape[2]), dtype=object)
     signal2Noise = np.zeros((spectra.shape[0], spectra.shape[2], 2048))
-    # Now we cycle through all the fits images again and we shift them and save them.
-    for specNum in range(spectra.shape[0]):
-        for order in range(spectra.shape[2]):
-            shifted_order = Spectrum1D(spectral_axis=spectra[specNum, 0, order]*u.AA + shifts[specNum]*u.AA,
-                                       flux=spectra[specNum, 5, order]*u.adu)
-            fullSpectrum[specNum, order] = shifted_order
-            signal2Noise[specNum, order] = spectra[specNum, 8, order]
+    with warnings.catch_warnings():  # Ignore warnings
+        warnings.simplefilter('ignore')
+        plt.figure()
+        for specNum in range(spectra.shape[0]):
+            spectraList = []
+            wls = np.empty(spectra[specNum, 0, :].shape)
+            flux = np.empty(spectra[specNum, 5, :].shape)
+            for order in range(spectra.shape[2]):
+                wls[order] = spectra[specNum, 0, order]
+                flux[order] = spectra[specNum, 5, order]
+                # We can use the wls_aux instead of wls cuz snr is better at longer wl
+                central_wavelength = np.median(wls[order])  
+                # Se encuentra los rangos espectrales superpuestos entre ordenes contiguos.
+                spectrum = Spectrum1D(flux=(flux[order]-np.median(flux[order]))*u.adu,
+                                      spectral_axis=wls[order]*u.AA, radial_velocity=0*u.km/u.s,
+                                      velocity_convention='optical')
+                if order != 0:
+                    spectrum.shift_spectrum_to(radial_velocity=shifts[specNum])
+                fullSpectrum[specNum, order] = spectrum
+                signal2Noise[specNum, order] = spectra[specNum, 8, order]
+            plt.plot(fullSpectrum[specNum, 14].spectral_axis, fullSpectrum[specNum, 14].flux - specNum * u.adu)
+        plt.xlim(5685, 5695)
+#         plt.show()
     return fullSpectrum, signal2Noise
 
 
@@ -144,6 +198,9 @@ def coadding(fullSpectrum, signal2Noise, name='TIC220414682'):
         else:
             coaddedSpectrum[order, 0, :] = np.average(orderData[:, 0, :], axis=0, weights=signal2Noise[:, order, :])
         coaddedSpectrum[order, 1, :] = wls
+    plt.plot(coaddedSpectrum[14, 1, :],coaddedSpectrum[14, 0, :])
+    plt.xlim(5685, 5695)
+#     plt.show()
     return coaddedSpectrum
 
 
@@ -171,7 +228,7 @@ def data_to_ceres(coadded, name='TIC220414682'):
     return
 
 
-def main(targetList=None):
+def main(targetList='targetList.txt', pdf=False):
     if targetList is None:
         raise Exception('Program needs a relative path to the target list to stack spectra.')
     path = current_dir / targetList
@@ -181,7 +238,8 @@ def main(targetList=None):
             spectra= read_fits(folder=target.strip())
             if len(spectra) < 2:
                 continue
-            fullSpectrum, signal2Noise = shifting(spectra)
+            shifts = ccf(spectra, target, pdf)
+            fullSpectrum, signal2Noise = shifting(spectra, shifts)
             coadded = coadding(fullSpectrum, signal2Noise, target.strip())
             print(f'Target {target.strip()} has been coadded with {fullSpectrum.shape[0]} spectra.')
             data_to_ceres(coadded, name=target.strip())
@@ -200,7 +258,8 @@ def main(targetList=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument('--pdf', action=argparse.BooleanOptionalAction, help='outputs pdf file for performance evaluation of the code')
     parser.add_argument("targetlist",
                         help="relative path to target list to stack spectra. Example: relative/path/to/targetList.txt")
     args = parser.parse_args()
-    main(targetList=args.targetlist)
+    main(targetList=args.targetlist, pdf=args.pdf)
