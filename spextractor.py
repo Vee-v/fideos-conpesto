@@ -432,4 +432,4 @@ if __name__ == "__main__":
     parser.add_argument("targetlist",
                         help="relative path to target list to stack spectra. Example: relative/path/to/targetList.txt")
     args = parser.parse_args()
-    main(targetList=args.targetlist, pdf=pdf)
+    main(targetList=args.targetlist, pdf=args.pdf)
